@@ -94,7 +94,7 @@ def save_csv(path:str, head:list, data_list:list):
         # 写入数据
         writer.writerows(data_list)
 
-    print(f"CSV文件已保存,{len(data_list)}条， 位置在", path)
+    print(f"CSV saving, {len(data_list)} ", path)
 
 
 def inference(model, test_loader,device=None):
@@ -143,10 +143,14 @@ def main_function():
     args.batch_size = 1
     args.num_dataloader_workers = 0
     os.makedirs('./out_file', exist_ok=True)
-    ground_protein = ''
-    esmfold_protein = ''
-    ground_ligand = ''
-    data_path = [[esmfold_protein, ground_ligand, ground_protein, ground_ligand]]
+    # ground protein (cutting pocket is helpful.
+    # using esmfold protein when we not have ground protein)
+    ground_protein = './example_data/posebusters_esmfold/ground_protein_prepared/5S8I_2LY_protein.pdb' 
+    esmfold_protein = './example_data/posebusters_esmfold/esmfold_prepared/5S8I_2LY_p.pdb' # esmfold predicted protein
+    cut_pocket_ligand = './example_data/posebusters_esmfold/ground_ligand/5S8I_2LY_ligand.sdf' # cut_pocket_ligand
+    init_ligand = './example_data/posebusters_esmfold/init_conformer_ligand/5S8I_2LY_ligand_start_conf.sdf' # docking ligand
+
+    data_path = [[esmfold_protein, init_ligand, ground_protein, cut_pocket_ligand]]
     test_loader = construct_loader(args, data_path=data_path, data_type='single_pocket',pretrain_method=None, save_pdb=True, max_align_rmsd=20,cut_r=10,min_align_rmsd=0.0)  
     model = get_model(args, device=device, no_parallel=False, inference=True) 
     # 保存诱导前和诱导后，并且对齐的口袋

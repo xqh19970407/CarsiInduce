@@ -2127,12 +2127,12 @@ class CrossDockDataSet(Dataset):
         #获取配体的特征
         
         lig_out_mol = self.get_mol_from_sdf_pdb_mol2(path_list=lig_out_path_list)
-            
+        lig_in_mol = self.get_mol_from_sdf_pdb_mol2(path_list=lig_in_path)
             
         if lig_out_mol is None: 
             print('load out ligand is None')
             return (None,None)
-        complex_graph = get_lig_feature(mol_=lig_out_mol,complex_graph=complex_graph,keep_original=self.keep_original, remove_hs=self.remove_hs, sdf_path=lig_in_path, data_type=self.data_type, pretrain_method=self.pretrain_method) # 根据lig_out获取配体特征
+        complex_graph = get_lig_feature(mol_=lig_in_mol,complex_graph=complex_graph,keep_original=self.keep_original, remove_hs=self.remove_hs, sdf_path=lig_in_path, data_type=self.data_type, pretrain_method=self.pretrain_method) # 根据lig_out获取配体特征
         if complex_graph is None: # 配体特征获取失败
             return (None,None)
         #对于配体被分为多个部分的连通图,则跳过该类分子
