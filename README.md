@@ -31,6 +31,9 @@ python inference_esmfold.py
 python compute_pocket_rmsd.py
 ```
 
+## CarsiDock-Flex = CarsiInduce + CarsiDock, using induced pocket to docking ligand
+### CarsiInduce
+### CarsiDock
 ## License
 The code of this repository is licensed under [GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.en.html). The use of the CarsiInduce model weights is subject to the [Model License](./MODEL_LICENSE.txt). CarsiInduce weights are completely open for academic research, please contact <bd@carbonsilicon.ai> for commercial use. 
 
