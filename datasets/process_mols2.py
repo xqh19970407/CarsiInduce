@@ -1,0 +1,589 @@
+import copy
+import os
+import warnings
+
+import numpy as np
+import scipy.spatial as spa
+import torch
+from Bio.PDB import PDBParser
+from Bio.PDB.PDBExceptions import PDBConstructionWarning
+from rdkit import Chem
+from rdkit.Chem.rdchem import BondType as BT
+from rdkit.Chem import AllChem, GetPeriodicTable, RemoveHs
+from rdkit.Geometry import Point3D
+from scipy import spatial
+from scipy.special import softmax
+from torch_cluster import radius_graph
+
+
+import torch.nn.functional as F
+
+from datasets.conformer_matching import get_torsion_angles, optimize_rotatable_bonds
+from utils.torsion import get_transformation_mask
+
+
+biopython_parser = PDBParser()
+periodic_table = GetPeriodicTable()
+allowable_features = {
+    'possible_atomic_num_list': list(range(1, 119)) + ['misc'],
+    'possible_chirality_list': [
+        'CHI_UNSPECIFIED',
+        'CHI_TETRAHEDRAL_CW',
+        'CHI_TETRAHEDRAL_CCW',
+        'CHI_OTHER'
+    ],
+    'possible_degree_list': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 'misc'],
+    'possible_numring_list': [0, 1, 2, 3, 4, 5, 6, 'misc'],
+    'possible_implicit_valence_list': [0, 1, 2, 3, 4, 5, 6, 'misc'],
+    'possible_formal_charge_list': [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 'misc'],
+    'possible_numH_list': [0, 1, 2, 3, 4, 5, 6, 7, 8, 'misc'],
+    'possible_number_radical_e_list': [0, 1, 2, 3, 4, 'misc'],
+    'possible_hybridization_list': [
+        'SP', 'SP2', 'SP3', 'SP3D', 'SP3D2', 'misc'
+    ],
+    'possible_is_aromatic_list': [False, True],
+    'possible_is_in_ring3_list': [False, True],
+    'possible_is_in_ring4_list': [False, True],
+    'possible_is_in_ring5_list': [False, True],
+    'possible_is_in_ring6_list': [False, True],
+    'possible_is_in_ring7_list': [False, True],
+    'possible_is_in_ring8_list': [False, True],
+    'possible_amino_acids': ['ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'ILE', 'LEU', 'LYS', 'MET',
+                             'PHE', 'PRO', 'SER', 'THR', 'TRP', 'TYR', 'VAL', 'HIP', 'HIE', 'TPO', 'HID', 'LEV', 'MEU',
+                             'PTR', 'GLV', 'CYT', 'SEP', 'HIZ', 'CYM', 'GLM', 'ASQ', 'TYS', 'CYX', 'GLZ', 'misc'],
+    'possible_atom_type_2': ['C*', 'CA', 'CB', 'CD', 'CE', 'CG', 'CH', 'CZ', 'N*', 'ND', 'NE', 'NH', 'NZ', 'O*', 'OD',
+                             'OE', 'OG', 'OH', 'OX', 'S*', 'SD', 'SG', 'misc'],
+    'possible_atom_type_3': ['C', 'CA', 'CB', 'CD', 'CD1', 'CD2', 'CE', 'CE1', 'CE2', 'CE3', 'CG', 'CG1', 'CG2', 'CH2',
+                             'CZ', 'CZ2', 'CZ3', 'N', 'ND1', 'ND2', 'NE', 'NE1', 'NE2', 'NH1', 'NH2', 'NZ', 'O', 'OD1',
+                             'OD2', 'OE1', 'OE2', 'OG', 'OG1', 'OH', 'OXT', 'SD', 'SG', 'misc'],
+}
+bonds = {BT.SINGLE: 0, BT.DOUBLE: 1, BT.TRIPLE: 2, BT.AROMATIC: 3}
+
+lig_feature_dims = (list(map(len, [
+    allowable_features['possible_atomic_num_list'],
+    allowable_features['possible_chirality_list'],
+    allowable_features['possible_degree_list'],
+    allowable_features['possible_formal_charge_list'],
+    allowable_features['possible_implicit_valence_list'],
+    allowable_features['possible_numH_list'],
+    allowable_features['possible_number_radical_e_list'],
+    allowable_features['possible_hybridization_list'],
+    allowable_features['possible_is_aromatic_list'],
+    allowable_features['possible_numring_list'],
+    allowable_features['possible_is_in_ring3_list'],
+    allowable_features['possible_is_in_ring4_list'],
+    allowable_features['possible_is_in_ring5_list'],
+    allowable_features['possible_is_in_ring6_list'],
+    allowable_features['possible_is_in_ring7_list'],
+    allowable_features['possible_is_in_ring8_list'],
+])), 0)  # number of scalar features
+
+rec_atom_feature_dims = (list(map(len, [
+    allowable_features['possible_amino_acids'],
+    allowable_features['possible_atomic_num_list'],
+    allowable_features['possible_atom_type_2'],
+    allowable_features['possible_atom_type_3'],
+])), 0)
+
+rec_residue_feature_dims = (list(map(len, [
+    allowable_features['possible_amino_acids']
+])), 0)
+
+
+def lig_atom_featurizer(mol):
+    ringinfo = mol.GetRingInfo()
+    atom_features_list = []
+    for idx, atom in enumerate(mol.GetAtoms()):
+        atom_features_list.append([
+            safe_index(allowable_features['possible_atomic_num_list'], atom.GetAtomicNum()),
+            allowable_features['possible_chirality_list'].index(str(atom.GetChiralTag())),
+            safe_index(allowable_features['possible_degree_list'], atom.GetTotalDegree()),
+            safe_index(allowable_features['possible_formal_charge_list'], atom.GetFormalCharge()),
+            safe_index(allowable_features['possible_implicit_valence_list'], atom.GetImplicitValence()),
+            safe_index(allowable_features['possible_numH_list'], atom.GetTotalNumHs()),
+            safe_index(allowable_features['possible_number_radical_e_list'], atom.GetNumRadicalElectrons()),
+            safe_index(allowable_features['possible_hybridization_list'], str(atom.GetHybridization())),
+            allowable_features['possible_is_aromatic_list'].index(atom.GetIsAromatic()),
+            safe_index(allowable_features['possible_numring_list'], ringinfo.NumAtomRings(idx)),
+            allowable_features['possible_is_in_ring3_list'].index(ringinfo.IsAtomInRingOfSize(idx, 3)),
+            allowable_features['possible_is_in_ring4_list'].index(ringinfo.IsAtomInRingOfSize(idx, 4)),
+            allowable_features['possible_is_in_ring5_list'].index(ringinfo.IsAtomInRingOfSize(idx, 5)),
+            allowable_features['possible_is_in_ring6_list'].index(ringinfo.IsAtomInRingOfSize(idx, 6)),
+            allowable_features['possible_is_in_ring7_list'].index(ringinfo.IsAtomInRingOfSize(idx, 7)),
+            allowable_features['possible_is_in_ring8_list'].index(ringinfo.IsAtomInRingOfSize(idx, 8)),
+        ])
+
+    return torch.tensor(atom_features_list)
+
+
+def rec_residue_featurizer(rec):
+    feature_list = []
+    for residue in rec.get_residues():
+        feature_list.append([safe_index(allowable_features['possible_amino_acids'], residue.get_resname())])
+    return torch.tensor(feature_list, dtype=torch.float32)  # (N_res, 1)
+
+
+def safe_index(l, e):
+    """ Return index of element e in list l. If e is not present, return the last index """
+    try:
+        return l.index(e)
+    except:
+        return len(l) - 1
+
+
+
+def parse_receptor(pdbid, pdbbind_dir):
+    rec = parsePDB(pdbid, pdbbind_dir)
+    return rec
+
+
+def parsePDB(pdbid, pdbbind_dir):
+    rec_path = os.path.join(pdbbind_dir, pdbid, f'{pdbid}_protein_processed.pdb')
+    return parse_pdb_from_path(rec_path)
+
+def parse_pdb_from_path(path):
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=PDBConstructionWarning)
+        structure = biopython_parser.get_structure('random_id', path)
+        rec = structure[0]
+    return rec
+
+
+def extract_receptor_structure(rec, lig, lm_embedding_chains=None):
+    # 获得配体相关的信息
+    conf = lig.GetConformer()
+    lig_coords = conf.GetPositions() # 获取配体三维坐标
+    
+    min_distances = []
+    coords = []
+    c_alpha_coords = []
+    n_coords = []
+    c_coords = []
+    valid_chain_ids = []
+    lengths = []
+    # 蛋白链 和 分子的交织信息。。。当我们换成口袋以后，该怎么交
+    for i, chain in enumerate(rec):# 蛋白质对肽链循环，因为只有一条或者两条，其实循环并不多
+        chain_coords = []  # num_residues, num_atoms, 3
+        chain_c_alpha_coords = []
+        chain_n_coords = []
+        chain_c_coords = []
+        count = 0
+        invalid_res_ids = []
+        for res_idx, residue in enumerate(chain):# 肽链对残基(氨基酸循环)
+            if residue.get_resname() == 'HOH':
+                invalid_res_ids.append(residue.get_id())
+                continue
+            residue_coords = []
+            c_alpha, n, c = None, None, None
+            for atom in residue:# 残基(氨基酸)对原子进行循环
+                if atom.name == 'CA': # 残基alpha碳原子
+                    c_alpha = list(atom.get_vector())
+                if atom.name == 'N': # 残基N原子
+                    n = list(atom.get_vector())
+                if atom.name == 'C': # 残基C原子
+                    c = list(atom.get_vector())
+                residue_coords.append(list(atom.get_vector())) # 对残基(氨基酸)上的所有原子取出它的坐标添加到一个列表中
+
+            if c_alpha != None and n != None and c != None:
+                # only append residue if it is an amino acid and not some weird molecule that is part of the complex
+                chain_c_alpha_coords.append(c_alpha) # 当前循环已经把 alpha c原子找到的时候就把它添加到alpha碳原子
+                chain_n_coords.append(n)
+                chain_c_coords.append(c)
+                chain_coords.append(np.array(residue_coords))# 把残基上的所有原子的坐标添加进去
+                count += 1
+            else:
+                invalid_res_ids.append(residue.get_id()) # 当我们遍历氨基酸上的所有的原子,没有找到alpha_c, c, N的时候，这个残基的编号就会被标记
+        for res_id in invalid_res_ids:
+            chain.detach_child(res_id) # 大概是要删除那些无效的残基
+        if len(chain_coords) > 0:
+            all_chain_coords = np.concatenate(chain_coords, axis=0)
+            distances = spatial.distance.cdist(lig_coords, all_chain_coords) # 计算蛋白肽链所有原子和小分子的距离矩阵
+            min_distance = distances.min() # 计算肽链和小分子距离矩阵的最小值
+        else:
+            min_distance = np.inf
+
+        min_distances.append(min_distance)
+        lengths.append(count)
+        coords.append(chain_coords)
+        c_alpha_coords.append(np.array(chain_c_alpha_coords))
+        n_coords.append(np.array(chain_n_coords))
+        c_coords.append(np.array(chain_c_coords))
+        if not count == 0: valid_chain_ids.append(chain.get_id())
+
+    min_distances = np.array(min_distances)
+    if len(valid_chain_ids) == 0:# 
+        valid_chain_ids.append(np.argmin(min_distances))# 当有效肽链的id是空时，选出那个和分子距离更近的那条肽链
+    valid_coords = []
+    valid_c_alpha_coords = []
+    valid_n_coords = []
+    valid_c_coords = []
+    valid_lengths = []
+    invalid_chain_ids = []
+    valid_lm_embeddings = []
+    for i, chain in enumerate(rec): # 蛋白对肽链循环
+        if chain.get_id() in valid_chain_ids:# 对有效肽链进行判断
+            valid_coords.append(coords[i])
+            valid_c_alpha_coords.append(c_alpha_coords[i])
+            if lm_embedding_chains is not None:
+                if i >= len(lm_embedding_chains):
+                    raise ValueError('Encountered valid chain id that was not present in the LM embeddings')
+                valid_lm_embeddings.append(lm_embedding_chains[i])
+            valid_n_coords.append(n_coords[i])
+            valid_c_coords.append(c_coords[i])
+            valid_lengths.append(lengths[i])
+        else:
+            invalid_chain_ids.append(chain.get_id())
+    coords = [item for sublist in valid_coords for item in sublist]  # list with n_residues arrays: [n_atoms, 3]
+
+    # 将列表中按照肽链分组的坐标进行cat
+    c_alpha_coords = np.concatenate(valid_c_alpha_coords, axis=0)  # [n_residues, 3] 
+    n_coords = np.concatenate(valid_n_coords, axis=0)  # [n_residues, 3]
+    c_coords = np.concatenate(valid_c_coords, axis=0)  # [n_residues, 3]
+    lm_embeddings = np.concatenate(valid_lm_embeddings, axis=0) if lm_embedding_chains is not None else None
+    for invalid_id in invalid_chain_ids:
+        rec.detach_child(invalid_id)
+
+    assert len(c_alpha_coords) == len(n_coords)
+    assert len(c_alpha_coords) == len(c_coords)
+    assert sum(valid_lengths) == len(c_alpha_coords)
+    # res 残基对象, 包含蛋白的几乎所有信息
+    # coords n_res个残基(氨基酸)的原子坐标 [[n_atoms,3]... ]   一万多个原子
+    # c_alpha_coords alpha_c原子的坐标 [n_res,3] 
+    # n_coords [n_res,3] 
+    # c_coords [n_res,3]
+    # lm_embeddings [n_res, 1280]
+    return rec, coords, c_alpha_coords, n_coords, c_coords, lm_embeddings  # 搞清楚这些信息的来源
+
+
+def get_lig_graph(mol, complex_graph):
+    lig_coords = torch.from_numpy(mol.GetConformer().GetPositions()).float()
+    atom_feats = lig_atom_featurizer(mol)
+
+    row, col, edge_type = [], [], []
+    for bond in mol.GetBonds():
+        start, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        row += [start, end]
+        col += [end, start]
+        edge_type += 2 * [bonds[bond.GetBondType()]] if bond.GetBondType() != BT.UNSPECIFIED else [0, 0]
+
+    edge_index = torch.tensor([row, col], dtype=torch.long)
+    edge_type = torch.tensor(edge_type, dtype=torch.long)
+    edge_attr = F.one_hot(edge_type, num_classes=len(bonds)).to(torch.float)
+
+    complex_graph['ligand'].x = atom_feats
+    complex_graph['ligand'].pos = lig_coords
+    complex_graph['ligand', 'lig_bond', 'ligand'].edge_index = edge_index
+    complex_graph['ligand', 'lig_bond', 'ligand'].edge_attr = edge_attr
+    return
+
+def generate_conformer(mol):
+    ps = AllChem.ETKDGv2()
+    id = AllChem.EmbedMolecule(mol, ps)
+    if id == -1:
+        print('rdkit coords could not be generated without using random coords. using random coords now.')
+        ps.useRandomCoords = True
+        AllChem.EmbedMolecule(mol, ps)
+        AllChem.MMFFOptimizeMolecule(mol, confId=0)
+    # else:
+    #    AllChem.MMFFOptimizeMolecule(mol_rdkit, confId=0)
+
+def get_lig_graph_with_matching(mol_, complex_graph, popsize, maxiter, matching, keep_original, num_conformers, remove_hs):
+    if matching:
+        mol_maybe_noh = copy.deepcopy(mol_)
+        if remove_hs:#False 默认不去H / 改为True 去H
+            mol_maybe_noh = RemoveHs(mol_maybe_noh, sanitize=True)
+        if keep_original:# True 将初始位置添加到图中 # 置信模型需要，以及评价
+            complex_graph['ligand'].orig_pos = mol_maybe_noh.GetConformer().GetPositions()
+
+        rotable_bonds = get_torsion_angles(mol_maybe_noh)# 获取可旋转键
+        if not rotable_bonds: print("no_rotable_bonds but still using it")
+        
+        # 生成构象
+        for i in range(num_conformers): # num_conformers = 1
+            
+            mol_rdkit = copy.deepcopy(mol_)
+
+            mol_rdkit.RemoveAllConformers()
+            mol_rdkit = AllChem.AddHs(mol_rdkit)
+            # 生成构象
+            generate_conformer(mol_rdkit)
+            if remove_hs:
+                mol_rdkit = RemoveHs(mol_rdkit, sanitize=True)
+            mol = copy.deepcopy(mol_maybe_noh)
+            if rotable_bonds:
+                try:
+                    optimize_rotatable_bonds(mol_rdkit, mol, rotable_bonds, popsize=popsize, maxiter=maxiter)# 优化可旋转键
+                except Exception as e:
+                    print(str(e))
+                    import traceback
+                    print(traceback.format_exc())
+                    import pdb
+                    pdb.set_trace()
+            # 将生成的构象添加到mol中
+            mol.AddConformer(mol_rdkit.GetConformer())
+            rms_list = []
+            # 对同一分子的不同构象先进行重叠排列再计算RMS,RMSlist：用于接收RMS的列表，
+            AllChem.AlignMolConformers(mol, RMSlist=rms_list)
+            mol_rdkit.RemoveAllConformers()
+            mol_rdkit.AddConformer(mol.GetConformers()[1])# 将生成的随机构象添加到mol_rdkit
+
+            if i == 0:
+                complex_graph.rmsd_matching = rms_list[0] # 将rms添加到图中 可有可无
+                get_lig_graph(mol_rdkit, complex_graph)# 添加配体的原子特征，边的特征，配体的第一个坐标
+            else:# 将生成的构象添加到图中，因为num=1,所以这个分支不会进来
+                if torch.is_tensor(complex_graph['ligand'].pos):
+                    complex_graph['ligand'].pos = [complex_graph['ligand'].pos]
+                complex_graph['ligand'].pos.append(torch.from_numpy(mol_rdkit.GetConformer().GetPositions()).float())
+
+    else:  # no matching
+        complex_graph.rmsd_matching = 0
+        if remove_hs: mol_ = RemoveHs(mol_)
+        get_lig_graph(mol_, complex_graph)
+
+    edge_mask, mask_rotate = get_transformation_mask(complex_graph)# 扭转键的信息
+    complex_graph['ligand'].edge_mask = torch.tensor(edge_mask)
+    complex_graph['ligand'].mask_rotate = mask_rotate
+
+    return
+
+
+
+def get_calpha_graph(data, complex_graph, cutoff=20, max_neighbor=None, lm_embeddings=None):
+    # cutoff 受体残基 和 受体残基的临界值为 15A
+    # max_neighbor 每个残基的最大临接数为 24
+    
+    # 口袋每个原子的坐标
+    if type( data['holo_pocket_coordinates'] )==list:
+        pocket_atoms_coord = copy.deepcopy(data['holo_pocket_coordinates'][0])
+    else:
+        pocket_atoms_coord = copy.deepcopy(data['holo_pocket_coordinates'])
+
+    complex_graph['receptor'].pos = torch.from_numpy(pocket_atoms_coord).float()
+    
+    # token和embeding做cat
+    # node_feat = rec_residue_featurizer(rec)
+    # torch.cat([node_feat, torch.tensor(lm_embeddings)], axis=1) if lm_embeddings is not None else node_feat
+    N_pocket_atoms = len(pocket_atoms_coord)
+    complex_graph['receptor'].x = torch.zeros([N_pocket_atoms, 1])
+    
+    # [N_pocket_atmos,5]   做一个循环，以每个口袋原子为中心，计算距离他15A以内的最多24个原子，按照5种粒度，得到距离的5类权重，再和距离做乘法，最终得到5类特征
+    # 对于每个口袋原子都得到5个粒度的特征
+    distances = spa.distance.cdist(pocket_atoms_coord, pocket_atoms_coord) #口袋原子的距离矩阵
+    src_list = []
+    dst_list = []
+    mean_norm_list = []
+    for i in range(N_pocket_atoms):
+        dst = list(np.where(distances[i, :] < cutoff)[0]) # 取出对于距离矩阵中小于15A的那些下标
+        dst.remove(i) # 把对角元去掉,对角元是自己和自己的距离
+        if max_neighbor != None and len(dst) > max_neighbor:
+            dst = list(np.argsort(distances[i, :]))[1: max_neighbor + 1] # 距离小于15A的氨基酸可能有很多，甚至超过了24个，那么我们只取前24的下标
+        if len(dst) == 0: # 如果在邻近距24A内没有找到原子(猜测种情况应该没有)
+            dst = list(np.argsort(distances[i, :]))[1:2]  # choose second because first is i itself
+            print(f'The cutoff {cutoff} was too small for one atoms such that it had no neighbors. '
+                  f'So we connected it to the closest other atoms')
+        if i in dst:
+            dst.remove(i)
+        assert i not in dst # 确保i没有在dst中，因为 是自己和自己
+        src = [i] * len(dst)
+        src_list.extend(src) # 最大邻接数是24, src_list [0]*24 + [1]*24 + [2]*22 + .....  
+        dst_list.extend(dst) # 最大邻接数是24, dst_list [0距离小于15A的下标] + [1距离小于15A的下标].....  
+        valid_dist = list(distances[i, dst])
+        valid_dist_np = distances[i, dst] # 取出有效原子距离
+        sigma = np.array([1., 2., 5., 10., 30.]).reshape((-1, 1))
+        weights = softmax(- valid_dist_np.reshape((1, -1)) ** 2 / sigma, axis=1)  # (sigma个数, 近邻数)
+        assert weights[0].sum() > 1 - 1e-2 and weights[0].sum() < 1.01 # 确保求和为1
+        diff_vecs = pocket_atoms_coord[src, :] - pocket_atoms_coord[dst, :]  # (neigh_num, 3) 计算出24个近邻原子和当前原子之间的差向量
+        mean_vec = weights.dot(diff_vecs)  # (sigma_num,neig_num)  @  (neigh_num, 3)  >>> (sigma_num, 3)    [5,3]  对距离向量做加权
+        # (sigma_num,neig_num) @ (neigh_num,) >>>  (sigma_num,)   [5,]
+        # [5,24] @ [24,] >>> [5]
+        denominator = weights.dot(np.linalg.norm(diff_vecs, axis=1))  # 将距离向量求和 [5]
+        mean_vec_ratio_norm = np.linalg.norm(mean_vec, axis=1) / denominator  # [5]
+        mean_norm_list.append(mean_vec_ratio_norm) 
+    assert len(src_list) == len(dst_list)
+    mu_r_norm = torch.from_numpy(np.array(mean_norm_list).astype(np.float32)) 
+    complex_graph['receptor'].mu_r_norm = mu_r_norm
+    
+    # 原子和近邻原子的特征
+    complex_graph['receptor', 'rec_contact', 'receptor'].edge_index = torch.from_numpy(np.asarray([src_list, dst_list]))
+
+    # [N_res,2,3]  先计算C原子相对alpha_C原子的位置差, N原子相对alpha_C原子的位置差，然后把它俩concat到一起得到
+    side_chain_vecs = torch.zeros([N_pocket_atoms,2,3])
+    complex_graph['receptor'].side_chain_vecs = side_chain_vecs.float()
+    
+    # n_rel_pos = n_coords - c_alpha_coords
+    # c_rel_pos = c_coords - c_alpha_coords
+    # side_chain_vecs = torch.from_numpy(
+    #     np.concatenate([np.expand_dims(n_rel_pos, axis=1), np.expand_dims(c_rel_pos, axis=1)], axis=1))
+    # complex_graph['receptor'].side_chain_vecs = side_chain_vecs.float()
+    return
+
+
+def rec_atom_featurizer(rec):
+    atom_feats = []
+    for i, atom in enumerate(rec.get_atoms()):
+        atom_name, element = atom.name, atom.element
+        if element == 'CD':
+            element = 'C'
+        assert not element == ''
+        try:
+            atomic_num = periodic_table.GetAtomicNumber(element)
+        except:
+            atomic_num = -1
+        atom_feat = [safe_index(allowable_features['possible_amino_acids'], atom.get_parent().get_resname()),
+                     safe_index(allowable_features['possible_atomic_num_list'], atomic_num),
+                     safe_index(allowable_features['possible_atom_type_2'], (atom_name + '*')[:2]),
+                     safe_index(allowable_features['possible_atom_type_3'], atom_name)]
+        atom_feats.append(atom_feat)
+
+    return atom_feats
+
+
+def get_rec_graph(data, rec, rec_coords, c_alpha_coords, n_coords, c_coords, complex_graph, rec_radius, c_alpha_max_neighbors=None, all_atoms=False,
+                  atom_radius=5, atom_max_neighbors=None, remove_hs=False, lm_embeddings=None):
+    if all_atoms:
+        return get_fullrec_graph(rec, rec_coords, c_alpha_coords, n_coords, c_coords, complex_graph,
+                                 c_alpha_cutoff=rec_radius, c_alpha_max_neighbors=c_alpha_max_neighbors,
+                                 atom_cutoff=atom_radius, atom_max_neighbors=atom_max_neighbors, remove_hs=remove_hs,lm_embeddings=lm_embeddings)
+    else:
+        return get_calpha_graph(data, rec, c_alpha_coords, n_coords, c_coords, complex_graph, rec_radius, c_alpha_max_neighbors,lm_embeddings=lm_embeddings)
+
+
+def get_fullrec_graph(rec, rec_coords, c_alpha_coords, n_coords, c_coords, complex_graph, c_alpha_cutoff=20,
+                      c_alpha_max_neighbors=None, atom_cutoff=5, atom_max_neighbors=None, remove_hs=False, lm_embeddings=None):
+    # builds the receptor graph with both residues and atoms
+
+    n_rel_pos = n_coords - c_alpha_coords
+    c_rel_pos = c_coords - c_alpha_coords
+    num_residues = len(c_alpha_coords)
+    if num_residues <= 1:
+        raise ValueError(f"rec contains only 1 residue!")
+
+    # Build the k-NN graph of residues
+    distances = spa.distance.cdist(c_alpha_coords, c_alpha_coords)
+    src_list = []
+    dst_list = []
+    mean_norm_list = []
+    for i in range(num_residues):
+        dst = list(np.where(distances[i, :] < c_alpha_cutoff)[0])
+        dst.remove(i)
+        if c_alpha_max_neighbors != None and len(dst) > c_alpha_max_neighbors:
+            dst = list(np.argsort(distances[i, :]))[1: c_alpha_max_neighbors + 1]
+        if len(dst) == 0:
+            dst = list(np.argsort(distances[i, :]))[1:2]  # choose second because first is i itself
+            print(f'The c_alpha_cutoff {c_alpha_cutoff} was too small for one c_alpha such that it had no neighbors. '
+                  f'So we connected it to the closest other c_alpha')
+        assert i not in dst
+        src = [i] * len(dst)
+        src_list.extend(src)
+        dst_list.extend(dst)
+        valid_dist = list(distances[i, dst])
+        valid_dist_np = distances[i, dst]
+        sigma = np.array([1., 2., 5., 10., 30.]).reshape((-1, 1))
+        weights = softmax(- valid_dist_np.reshape((1, -1)) ** 2 / sigma, axis=1)  # (sigma_num, neigh_num)
+        assert 1 - 1e-2 < weights[0].sum() < 1.01
+        diff_vecs = c_alpha_coords[src, :] - c_alpha_coords[dst, :]  # (neigh_num, 3)
+        mean_vec = weights.dot(diff_vecs)  # (sigma_num, 3)
+        denominator = weights.dot(np.linalg.norm(diff_vecs, axis=1))  # (sigma_num,)
+        mean_vec_ratio_norm = np.linalg.norm(mean_vec, axis=1) / denominator  # (sigma_num,)
+        mean_norm_list.append(mean_vec_ratio_norm)
+    assert len(src_list) == len(dst_list)
+
+    node_feat = rec_residue_featurizer(rec)
+    mu_r_norm = torch.from_numpy(np.array(mean_norm_list).astype(np.float32))
+    side_chain_vecs = torch.from_numpy(
+        np.concatenate([np.expand_dims(n_rel_pos, axis=1), np.expand_dims(c_rel_pos, axis=1)], axis=1))
+
+    complex_graph['receptor'].x = torch.cat([node_feat, torch.tensor(lm_embeddings)], axis=1) if lm_embeddings is not None else node_feat
+    complex_graph['receptor'].pos = torch.from_numpy(c_alpha_coords).float()
+    complex_graph['receptor'].mu_r_norm = mu_r_norm
+    complex_graph['receptor'].side_chain_vecs = side_chain_vecs.float()
+    complex_graph['receptor', 'rec_contact', 'receptor'].edge_index = torch.from_numpy(np.asarray([src_list, dst_list]))
+
+    src_c_alpha_idx = np.concatenate([np.asarray([i]*len(l)) for i, l in enumerate(rec_coords)])
+    atom_feat = torch.from_numpy(np.asarray(rec_atom_featurizer(rec)))
+    atom_coords = torch.from_numpy(np.concatenate(rec_coords, axis=0)).float()
+
+    if remove_hs:
+        not_hs = (atom_feat[:, 1] != 0)
+        src_c_alpha_idx = src_c_alpha_idx[not_hs]
+        atom_feat = atom_feat[not_hs]
+        atom_coords = atom_coords[not_hs]
+
+    atoms_edge_index = radius_graph(atom_coords, atom_cutoff, max_num_neighbors=atom_max_neighbors if atom_max_neighbors else 1000)
+    atom_res_edge_index = torch.from_numpy(np.asarray([np.arange(len(atom_feat)), src_c_alpha_idx])).long()
+
+    complex_graph['atom'].x = atom_feat
+    complex_graph['atom'].pos = atom_coords
+    complex_graph['atom', 'atom_contact', 'atom'].edge_index = atoms_edge_index
+    complex_graph['atom', 'atom_rec_contact', 'receptor'].edge_index = atom_res_edge_index
+
+    return
+
+def write_mol_with_coords(mol, new_coords, path):
+    w = Chem.SDWriter(path)
+    conf = mol.GetConformer()
+    for i in range(mol.GetNumAtoms()):
+        x,y,z = new_coords.astype(np.double)[i]
+        conf.SetAtomPosition(i,Point3D(x,y,z))
+    w.write(mol)
+    w.close()
+
+def read_molecule(molecule_file, sanitize=False, calc_charges=False, remove_hs=False):
+    if molecule_file.endswith('.mol2'):
+        mol = Chem.MolFromMol2File(molecule_file, sanitize=False, removeHs=False)
+    elif molecule_file.endswith('.sdf'):
+        supplier = Chem.SDMolSupplier(molecule_file, sanitize=False, removeHs=False)
+        mol = supplier[0]
+    elif molecule_file.endswith('.pdbqt'):
+        with open(molecule_file) as file:
+            pdbqt_data = file.readlines()
+        pdb_block = ''
+        for line in pdbqt_data:
+            pdb_block += '{}\n'.format(line[:66])
+        mol = Chem.MolFromPDBBlock(pdb_block, sanitize=False, removeHs=False)
+    elif molecule_file.endswith('.pdb'):
+        mol = Chem.MolFromPDBFile(molecule_file, sanitize=False, removeHs=False)
+    else:
+        raise ValueError('Expect the format of the molecule_file to be '
+                         'one of .mol2, .sdf, .pdbqt and .pdb, got {}'.format(molecule_file))
+
+    try:
+        if sanitize or calc_charges:
+            Chem.SanitizeMol(mol)
+
+        if calc_charges:
+            # Compute Gasteiger charges on the molecule.
+            try:
+                AllChem.ComputeGasteigerCharges(mol)
+            except:
+                warnings.warn('Unable to compute charges for the molecule.')
+
+        if remove_hs:
+            mol = Chem.RemoveHs(mol, sanitize=sanitize)
+    except Exception as e:
+        print(e)
+        print("RDKit was unable to read the molecule.")
+        return None
+
+    return mol
+
+
+def read_sdf_or_mol2(sdf_fileName, mol2_fileName):
+
+    mol = Chem.MolFromMolFile(sdf_fileName, sanitize=False)
+    problem = False
+    try:
+        Chem.SanitizeMol(mol)
+        mol = Chem.RemoveHs(mol)
+    except Exception as e:
+        problem = True
+    if problem:
+        mol = Chem.MolFromMol2File(mol2_fileName, sanitize=False)
+        try:
+            Chem.SanitizeMol(mol)
+            mol = Chem.RemoveHs(mol)
+            problem = False
+        except Exception as e:
+            problem = True
+
+    return mol, problem
